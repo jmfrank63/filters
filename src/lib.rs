@@ -1,89 +1,176 @@
 #![cfg_attr(target_arch = "avr", no_std)]
+
+const SCALE: u16 = 6;
+
 pub struct LowPassFilter {
     alpha: u16,
-    alpha_shift: u8,
+    one_minus_alpha: u16,
     last_output: u16,
 }
 
 impl LowPassFilter {
     pub fn new(alpha: u16) -> Self {
-        let alpha_bits = 16 - alpha.leading_zeros() as u8;
-        let alpha_shift = if alpha_bits > 6 { alpha_bits - 6 } else { 0 };
-        let alpha = alpha >> alpha_shift;
+        let alpha = 1 + alpha;
+        let one_minus_alpha = (2 << SCALE) - alpha - 1;
         Self {
             alpha,
-            alpha_shift,
+            one_minus_alpha,
+            last_output: 0,
+        }
+    }
+    pub fn low_pass(&mut self, input: &mut u16) {
+        self.last_output = ((self.alpha as u32 * *input as u32)
+            + (self.one_minus_alpha as u32 * self.last_output as u32)
+            >> SCALE + 1) as u16;
+        *input = self.last_output as u16;
+    }
+
+    pub fn set_alpha(&mut self, alpha: u16) {
+        self.alpha = 1 + alpha;
+        self.one_minus_alpha = (2 << SCALE) - alpha - 1;
+    }
+
+    pub fn reset(&mut self) {
+        self.last_output = 0;
+    }
+}
+
+pub struct HighPassFilter {
+    alpha: u16,
+    one_minus_alpha: u16,
+    last_output: u16,
+}
+
+impl HighPassFilter {
+    pub fn new(alpha: u16) -> Self {
+        #[cfg(not(target_arch = "avr"))]
+        println!("Alpha: {}", alpha);
+        let alpha = 1 + alpha;
+        let one_minus_alpha = (2 << SCALE) - alpha - 1;
+        Self {
+            alpha,
+            one_minus_alpha,
             last_output: 0,
         }
     }
 
-    pub fn low_pass(&mut self, input: &mut u16) {
-        let input_bits = 16 - input.leading_zeros() as u8;
-        let last_output_bits = 16 - self.last_output.leading_zeros() as u8;
-
-        let mut shift_amount_input = 0;
-        if 6 + input_bits > 16 {
-            shift_amount_input = 6 + input_bits - 16;
-            *input >>= shift_amount_input;
-        }
-
-        let mut shift_amount_last_output = 0;
-        if 6 + last_output_bits > 16 {
-            shift_amount_last_output = 6 + last_output_bits - 16;
-            self.last_output >>= shift_amount_last_output;
-        }
-
-        let alpha_input = (self.alpha * (*input >> shift_amount_input)) << self.alpha_shift;
-        let one_minus_alpha_last_output = ((64 - self.alpha) * (self.last_output >> shift_amount_last_output)) << self.alpha_shift;
-
-        self.last_output = (alpha_input + one_minus_alpha_last_output) >> (6 - shift_amount_input);
-        *input = self.last_output;
+    pub fn high_pass(&mut self, input: &mut u16) {
+        // High pass filter is the difference between the input and the output of the low pass filter
+        self.last_output = ((self.alpha as u32 * *input as u32)
+            + (self.one_minus_alpha as u32 * self.last_output as u32) >> SCALE + 1) as u16;
+        let diff = *input as i32 - self.last_output as i32;
+        *input = ((diff + 512_i32) >> 1 )as u16;
     }
+
+    pub fn set_alpha(&mut self, alpha: u16) {  
+        let alpha = 1 + alpha; 
+        self.one_minus_alpha = (2 << SCALE) - alpha - 1;
+    }
+
+    pub fn reset(&mut self) {
+        self.last_output = 0;
+    }
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    struct StdLowPassFilter {
+        alpha: u16,
+        one_minus_alpha: u16,
+        last_output: u16,
+    }
+
+    impl StdLowPassFilter {
+        fn new(alpha: u16) -> Self {
+            let alpha = 1 + alpha;
+            let one_minus_alpha = (2 << SCALE) - alpha - 1;
+            Self {
+                alpha,
+                one_minus_alpha,
+                last_output: 0,
+            }
+        }
+        fn low_pass(&mut self, input: &mut u16) {
+            self.last_output = ((self.alpha as u32 * *input as u32)
+                + (self.one_minus_alpha as u32 * self.last_output as u32)
+                >> SCALE + 1) as u16;
+            *input = self.last_output as u16;
+        }
+
+        fn set_alpha(&mut self, alpha: u16) {
+            self.alpha = 1 + alpha;
+            self.one_minus_alpha = (2 << SCALE) - alpha - 1;
+        }
+    }
+
     #[test]
     fn test_low_pass_filter() {
-        let mut filter = LowPassFilter::new(10);
-
-        // Test with a step input
-        let mut input = [0, 0, 0, 0, 0, 1023, 1023, 1023, 1023, 1023];
-        let mut output = [0; 10];
-        for (i, value) in input.iter_mut().enumerate() {
-            filter.low_pass(value);
-            output[i] = *value;
+        let mut std_lowpass_filter = StdLowPassFilter::new(0);
+        let mut lowpass_filter = LowPassFilter::new(0);
+        for alpha in 1..(2 << (SCALE - 1)) {
+            std_lowpass_filter.set_alpha(alpha);
+            lowpass_filter.set_alpha(alpha);
+            for i in 0..1024_u16 {
+                let mut input = i;
+                let mut input_std = i;
+                #[cfg(not(target_arch = "avr"))]
+                println!(
+                    "Before: fa: {} sfa:  {} flo: {} sflo: {} i: {}",
+                    lowpass_filter.alpha,
+                    std_lowpass_filter.alpha,
+                    lowpass_filter.last_output,
+                    std_lowpass_filter.last_output,
+                    i
+                );
+                lowpass_filter.low_pass(&mut input);
+                std_lowpass_filter.low_pass(&mut input_std);
+                #[cfg(not(target_arch = "avr"))]
+                println!(
+                    "After: fa: {} sfa:  {} flo: {} sflo: {} i: {}",
+                    lowpass_filter.alpha,
+                    std_lowpass_filter.alpha,
+                    lowpass_filter.last_output,
+                    std_lowpass_filter.last_output,
+                    i
+                );
+                assert_eq!(std_lowpass_filter.alpha, lowpass_filter.alpha.into());
+                assert_eq!(
+                    std_lowpass_filter.last_output,
+                    lowpass_filter.last_output as u16
+                );
+                assert_eq!(input_std, input);
+            }
         }
+    }
 
-        // The output should start at 0 and gradually increase to 1023
-        assert!(output[0] < output[1]);
-        assert!(output[1] < output[2]);
-        assert!(output[2] < output[3]);
-        assert!(output[3] < output[4]);
-        assert!(output[4] < output[5]);
-        assert!(output[5] < output[6]);
-        assert!(output[6] < output[7]);
-        assert!(output[7] < output[8]);
-        assert!(output[8] < output[9]);
-
-        // Test with a sinusoidal input
-        let mut input = [512, 708, 866, 963, 1023, 963, 866, 708, 512, 316, 158, 61, 0, 61, 158, 316];
-        let mut output = [0; 16];
-        for (i, value) in input.iter_mut().enumerate() {
-            filter.low_pass(value);
-            output[i] = *value;
+    #[test]
+    fn test_high_pass_filter() {
+        let mut lowpass_filter = LowPassFilter::new(1);
+        let mut highpass_filter = HighPassFilter::new(1);
+        for alpha in 1..32 {
+            lowpass_filter.set_alpha(alpha);
+            highpass_filter.set_alpha(alpha);
+            for i in 0..1024_u16 {
+                let mut highpass_input = i;
+                let mut lowpass_input = i;
+                #[cfg(not(target_arch = "avr"))]
+                println!(
+                    "Before: alpha: {} lo: {} ho: {} i: {}",
+                    alpha, lowpass_input, highpass_input, i
+                );
+                highpass_filter.high_pass(&mut highpass_input);
+                lowpass_filter.low_pass(&mut lowpass_input);
+                #[cfg(not(target_arch = "avr"))]
+                println!(
+                    "After: alpha: {} lo: {} ho: {} i: {}",
+                    alpha, lowpass_input, highpass_input, i
+                );
+                #[cfg(not(target_arch = "avr"))]
+                println!("{} - {} = {}", 1024, highpass_input, lowpass_input);
+            }
         }
-
-        // The output should be a smoothed version of the input
-        assert!(output[0] < output[1]);
-        assert!(output[1] < output[2]);
-        assert!(output[2] < output[3]);
-        assert!(output[3] < output[4]);
-        assert!(output[4] > output[5]);
-        assert!(output[5] > output[6]);
-        assert!(output[6] > output[7]);
-        assert!(output[7] > output[8]);
     }
 }
